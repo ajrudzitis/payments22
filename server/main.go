@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	_ "github.com/stripe/stripe-go/v78"
 	"golang.org/x/crypto/ssh"
 )
@@ -47,7 +48,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Starting server on %s:%s\n", bindAddr, port)
+	log.Infof("Starting server on %s:%s\n", bindAddr, port)
 
 	// create the API server
 	createAPIServer(externAddr, port, bindIP)
@@ -59,6 +60,10 @@ func main() {
 func createAPIServer(externAddr, port string, bindIP net.IP) {
 
 	http.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		log.WithContext(ctx).Info("received request to create payment server")
+
 		// parse the amount from the request url param
 		amountStr := r.URL.Query().Get("amount")
 		if amountStr == "" {
@@ -66,7 +71,7 @@ func createAPIServer(externAddr, port string, bindIP net.IP) {
 			return
 		}
 
-		connectStr, err := createPaymentSSHServer(amountStr, externAddr, bindIP)
+		connectStr, err := createPaymentSSHServer(ctx, amountStr, externAddr, bindIP)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to create payment server: %v", err), http.StatusInternalServerError)
 			return
@@ -83,7 +88,7 @@ func createAPIServer(externAddr, port string, bindIP net.IP) {
 // createPaymentSSHServer server creates a new SSH server on a random port, with a random
 // user and password, to accept payment details. It returns a connection string if sucessful,
 // or an error if not.
-func createPaymentSSHServer(amount, externAddr string, bindIP net.IP) (string, error) {
+func createPaymentSSHServer(ctx context.Context, amount, externAddr string, bindIP net.IP) (string, error) {
 	// generate a random user name of the form "payme" suffixed by six random digits
 	username := fmt.Sprintf("payme%06d", mathrand.Intn(1000000))
 
@@ -115,6 +120,9 @@ func createPaymentSSHServer(amount, externAddr string, bindIP net.IP) (string, e
 		return "", fmt.Errorf("failed to get port: %w", err)
 	}
 
+	// log the listender
+	log.WithContext(ctx).Infof("SSH connection listening on %s", listener.Addr().String())
+
 	// create connection string for the server that can be used to ssh to the listerner
 	// with the given username and password
 	connStr := fmt.Sprintf("ssh %s@%s -p %s", username, externAddr, port)
@@ -129,9 +137,10 @@ func createPaymentSSHServer(amount, externAddr string, bindIP net.IP) (string, e
 
 		select {
 		case <-time.After(paymentTimeout):
-
-		case _ = <-runPaymentService(ctx, *listener, config, amount):
+			log.WithContext(ctx).Infof("payment server on %s timed out", listener.Addr().String())
+		case <-runPaymentService(ctx, *listener, config, amount):
 			//TODO : log any error in the result
+			log.WithContext(ctx).Infof("payment completed on %s", listener.Addr().String())
 		}
 		cancelFn()
 	}()
@@ -153,7 +162,10 @@ func runPaymentService(ctx context.Context, listener net.TCPListener, config *ss
 		connectionResult := make(chan paymentResult)
 		defer close(done)
 		defer close(connectionResult)
-		defer func() { _ = listener.Close() }()
+		defer func() {
+			log.WithContext(ctx).Infof("closing listener %s", listener.Addr().String())
+			_ = listener.Close()
+		}()
 
 	Loop:
 		for {
@@ -163,9 +175,12 @@ func runPaymentService(ctx context.Context, listener net.TCPListener, config *ss
 				break Loop
 			case result := <-connectionResult:
 				// decrement the wait group
+				log.WithContext(ctx).Infof("connection result: %v", result.err)
 				wg.Done()
 				if result.err != nil {
 					done <- paymentResult{err: fmt.Errorf("failed to accept connection: %w", result.err)}
+				} else {
+					done <- paymentResult{}
 					break Loop
 				}
 			default:
@@ -185,17 +200,21 @@ func runPaymentService(ctx context.Context, listener net.TCPListener, config *ss
 				return
 			}
 
+			log.WithContext(ctx).Infof("accepted connection from %s", conn.RemoteAddr().String())
+
 			wg.Add(1)
 			go handleConnection(ctx, conn, config, amount, connectionResult)
 		}
+		log.WithContext(ctx).Infof("waiting for connections to close")
 		wg.Wait()
+		log.WithContext(ctx).Infof("connections have closed")
 	}()
 	return done
 }
 
 func handleConnection(ctx context.Context, conn net.Conn, config *ssh.ServerConfig, amount string, connectionResult chan<- paymentResult) {
 	// handle the connection
-	_, chans, reqs, err := ssh.NewServerConn(conn, config)
+	server, chans, reqs, err := ssh.NewServerConn(conn, config)
 	if err != nil {
 		fmt.Printf("failed to handshake: %v\n", err)
 		return
@@ -238,11 +257,12 @@ func handleConnection(ctx context.Context, conn net.Conn, config *ssh.ServerConf
 		acceptPaymentScript(amount, channel)
 		// send the result
 		connectionResult <- paymentResult{err: nil}
+
 		// close the channel
 		channel.Close()
 	}
-	fmt.Println("connection close")
-	// wait for shutdown signal
+	server.Close()
+	log.WithContext(ctx).Infof("completed session from %s", conn.RemoteAddr().String())
 }
 
 func acceptPaymentScript(amount string, channel ssh.Channel) {
