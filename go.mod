@@ -1,4 +1,4 @@
-module github.com/ajrudzitis/stripe-terminal
+module github.com/ajrudzitis/payments22
 
 go 1.22.2
 
