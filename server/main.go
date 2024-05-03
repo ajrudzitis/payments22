@@ -20,21 +20,25 @@ func main() {
 	// if none are provided, use the default values
 	bindAddr := "localhost"
 	port := "8080"
+	externAddr := bindAddr
 	// read from the command line
 	if len(os.Args) > 1 {
-		bindAddr = os.Args[1]
+		externAddr = os.Args[1]
 	}
 	if len(os.Args) > 2 {
-		port = os.Args[2]
+		bindAddr = os.Args[2]
+	}
+	if len(os.Args) > 3 {
+		port = os.Args[3]
 	}
 
-	createAPIServer(bindAddr, port)
+	createAPIServer(externAddr, bindAddr, port)
 
 }
 
 // createAPIServer will create a new HTTP server to receive requests
 // to create HTTP servers
-func createAPIServer(bindAddr string, port string) {
+func createAPIServer(externAddr, bindAddr, port string) {
 
 	http.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
 		// parse the amount from the request url param
@@ -44,7 +48,7 @@ func createAPIServer(bindAddr string, port string) {
 			return
 		}
 
-		connectStr, err := createPaymentSSHServer(amountStr, bindAddr)
+		connectStr, err := createPaymentSSHServer(amountStr, externAddr, bindAddr)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to create payment server: %v", err), http.StatusInternalServerError)
 			return
@@ -61,7 +65,7 @@ func createAPIServer(bindAddr string, port string) {
 // createPaymentSSHServer server creates a new SSH server on a random port, with a random
 // user and password, to accept payment details. It returns a connection string if sucessful,
 // or an error if not.
-func createPaymentSSHServer(amount string, bindAddr string) (string, error) {
+func createPaymentSSHServer(amount, externAddr, bindAddr string) (string, error) {
 	// generate a random user name of the form "payme" suffixed by six random digits
 	username := fmt.Sprintf("payme%06d", mathrand.Intn(1000000))
 	// generate a random password made up of 12 random characters
@@ -103,7 +107,7 @@ func createPaymentSSHServer(amount string, bindAddr string) (string, error) {
 
 	// create connection string for the server that can be used to ssh to the listerner
 	// with the given username and password
-	connStr := fmt.Sprintf("ssh %s@%s -p %s", username, bindAddr, port)
+	connStr := fmt.Sprintf("ssh %s@%s -p %s", username, externAddr, port)
 
 	// create the server in a goroutine
 	go func() {
