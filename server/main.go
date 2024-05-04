@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
 	_ "github.com/stripe/stripe-go/v78"
 	"golang.org/x/crypto/ssh"
@@ -239,6 +240,15 @@ func handleConnection(ctx context.Context, conn net.Conn, config *ssh.ServerConf
 			return
 		}
 
+		// create a new pty emulator
+		pty := &sshtty{
+			channel: channel,
+		}
+		screen, err := tcell.NewTerminfoScreenFromTty(pty)
+		if err != nil {
+			log.Errorf("failed to create terminfo screen: %v", err)
+		}
+
 		// handle requests on the channel
 		go func() {
 			// we're okay with this being a shell or pty request
@@ -249,12 +259,22 @@ func handleConnection(ctx context.Context, conn net.Conn, config *ssh.ServerConf
 					ok = true
 				case "pty-req":
 					ok = true
+
+					// unmarshal the pty request
+					ptyReq := &ptyRequestMsg{}
+					err := ssh.Unmarshal(req.Payload, ptyReq)
+					if err != nil {
+						log.Errorf("failed to unmarshal pty request: %v", err)
+						break
+					}
+
+					// update the window size
+					pty.UpdateWindow(tcell.WindowSize{Width: int(ptyReq.Columns), Height: int(ptyReq.Rows), PixelWidth: int(ptyReq.Width), PixelHeight: int(ptyReq.Height)})
 				}
 				req.Reply(ok, nil)
 			}
 		}()
-		// TODO: clean up this code
-		acceptPaymentScript(amount, channel)
+		acceptPaymentWindow(amount, screen)
 		// send the result
 		connectionResult <- paymentResult{err: nil}
 
@@ -265,42 +285,88 @@ func handleConnection(ctx context.Context, conn net.Conn, config *ssh.ServerConf
 	log.WithContext(ctx).Infof("completed session from %s", conn.RemoteAddr().String())
 }
 
-func acceptPaymentScript(amount string, channel ssh.Channel) {
-	_, err := channel.Write([]byte(fmt.Sprintf("Welcome to the payment server\r\nYou owe: $%s\r\nEnter a card number: ", amount)))
-	if err != nil {
-		fmt.Printf("failed to write to channel: %v\n", err)
-		return
-	}
-
-	// read the payment details from the channel
-	// and process the payment
-	cardNumer, err := readNextLine(channel)
-	if err != nil {
-		fmt.Printf("failed to read card number: %v\n", err)
-		return
-	}
-	fmt.Printf("card number: %s\n", cardNumer)
-
-	_, err = channel.Write([]byte("\r\nThank you for your payment\r\n"))
-	if err != nil {
-		fmt.Printf("failed to write to channel: %v\n", err)
-		return
+func acceptPaymentWindow(amount string, screen tcell.Screen) {
+	app := tview.NewApplication()
+	app.SetScreen(screen)
+	cardNumber := ""
+	form := tview.NewForm().
+		AddTextView("Amount", fmt.Sprintf("$%s", amount), 40, 2, true, false).
+		AddInputField("Enter Card Number", "", 16, nil, func(text string) { cardNumber = text }).
+		AddButton("Submit", func() {
+			fmt.Printf("Card Number: %s\n", cardNumber)
+			app.Stop()
+		}).
+		AddButton("Quit", func() {
+			app.Stop()
+		})
+	form.SetBorder(true).SetTitle("Enter Payment Details").SetTitleAlign(tview.AlignLeft)
+	if err := app.SetRoot(form, true).Run(); err != nil {
+		log.Errorf("failed to run app: %v", err)
 	}
 }
 
-func readNextLine(channel ssh.Channel) (string, error) {
-	var buf bytes.Buffer
-	for {
-		b := make([]byte, 1)
-		_, err := channel.Read(b)
-		if err != nil {
-			return "", fmt.Errorf("failed to read from channel: %w", err)
-		}
-		buf.Write(b)
-		if b[0] == '\r' {
-			break
-		}
-		channel.Write(b)
-	}
-	return buf.String(), nil
+// ptyRequestMsg is a message that is sent when a pty request is made
+type ptyRequestMsg struct {
+	Term     string
+	Columns  uint32
+	Rows     uint32
+	Width    uint32
+	Height   uint32
+	Modelist string
 }
+
+// sshtty is a tcell.Tty implementation that uses an ssh channel
+type sshtty struct {
+	channel    ssh.Channel
+	windowSize tcell.WindowSize
+	windowCb   func()
+}
+
+// Close implements tcell.Tty.
+func (s *sshtty) Close() error {
+	return s.channel.Close()
+}
+
+// Read implements tcell.Tty.
+func (s *sshtty) Read(p []byte) (n int, err error) {
+	return s.channel.Read(p)
+}
+
+// Write implements tcell.Tty.
+func (s *sshtty) Write(p []byte) (n int, err error) {
+	return s.channel.Write(p)
+}
+
+func (s *sshtty) UpdateWindow(size tcell.WindowSize) {
+	s.windowSize = size
+	if s.windowCb != nil {
+		s.windowCb()
+	}
+}
+
+// Drain implements tcell.Tty.
+func (s *sshtty) Drain() error {
+	return nil
+}
+
+// NotifyResize implements tcell.Tty.
+func (s *sshtty) NotifyResize(cb func()) {
+	s.windowCb = cb
+}
+
+// Start implements tcell.Tty.
+func (s *sshtty) Start() error {
+	return nil
+}
+
+// Stop implements tcell.Tty.
+func (s *sshtty) Stop() error {
+	return nil
+}
+
+// WindowSize implements tcell.Tty.
+func (s *sshtty) WindowSize() (tcell.WindowSize, error) {
+	return s.windowSize, nil
+}
+
+var _ tcell.Tty = &sshtty{}
